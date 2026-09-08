@@ -1,0 +1,357 @@
+import { beforeEach, expect, jest, test } from '@jest/globals'
+
+const cleanOrphanedInstallDirs = jest.fn()
+const createInstallDir = jest.fn()
+const getHashLink = jest.fn()
+const getGlobalPackageDetails = jest.fn<(pkg: unknown) => Promise<Array<{ alias: string, version: string }>>>().mockResolvedValue([])
+const getInstalledBinNames = jest.fn<() => Promise<string[]>>().mockResolvedValue([])
+const scanGlobalPackages = jest.fn()
+const checkGlobalBinConflicts = jest.fn<() => Promise<Set<string>>>().mockResolvedValue(new Set())
+const installGlobalPackages = jest.fn<(...args: unknown[]) => Promise<{ ignoredBuilds: undefined, resolutionPolicyViolations: [], resolvedVersions: Record<string, string> }>>()
+  .mockResolvedValue({ ignoredBuilds: undefined, resolutionPolicyViolations: [], resolvedVersions: {} })
+const promptApproveGlobalBuilds = jest.fn<() => Promise<void>>().mockResolvedValue(undefined)
+const readInstalledPackages = jest.fn<(installDir: string) => Promise<Array<{ alias: string, manifest: { name: string, version: string } }>>>().mockResolvedValue([])
+const summaryDebug = jest.fn()
+const activateGlobalInstall = jest.fn<(opts: unknown) => Promise<Set<string>>>().mockResolvedValue(new Set(['fresh']))
+const cleanupReplacedGlobalInstalls = jest.fn<(opts: unknown) => Promise<void>>().mockResolvedValue(undefined)
+
+jest.unstable_mockModule('@pnpm/core-loggers', () => ({ summaryLogger: { debug: summaryDebug } }))
+jest.unstable_mockModule('@pnpm/global.packages', () => ({
+  cleanOrphanedInstallDirs,
+  createInstallDir,
+  getGlobalPackageDetails,
+  getHashLink,
+  getInstalledBinNames,
+  scanGlobalPackages,
+}))
+jest.unstable_mockModule('../src/checkGlobalBinConflicts.js', () => ({ checkGlobalBinConflicts }))
+jest.unstable_mockModule('../src/globalActivation.js', () => ({ cleanupReplacedGlobalInstalls, activateGlobalInstall }))
+jest.unstable_mockModule('../src/installGlobalPackages.js', () => ({ installGlobalPackages }))
+jest.unstable_mockModule('../src/promptApproveGlobalBuilds.js', () => ({ promptApproveGlobalBuilds }))
+jest.unstable_mockModule('../src/readInstalledPackages.js', () => ({ readInstalledPackages }))
+
+const { handleGlobalUpdate } = await import('../src/globalUpdate.js')
+
+beforeEach(() => {
+  jest.clearAllMocks()
+  checkGlobalBinConflicts.mockResolvedValue(new Set())
+  cleanupReplacedGlobalInstalls.mockResolvedValue(undefined)
+  getGlobalPackageDetails.mockResolvedValue([])
+  getInstalledBinNames.mockResolvedValue([])
+  installGlobalPackages.mockResolvedValue({
+    ignoredBuilds: undefined,
+    resolutionPolicyViolations: [],
+    resolvedVersions: {},
+  })
+  readInstalledPackages.mockResolvedValue([])
+  activateGlobalInstall.mockResolvedValue(new Set(['fresh']))
+})
+
+test('global update emits a single summary after updating all isolated groups', async () => {
+  const updateResolutionPolicyManifest = jest.fn<() => Promise<void>>().mockResolvedValue(undefined)
+  createInstallDir
+    .mockReturnValueOnce('/global/v11/install-1')
+    .mockReturnValueOnce('/global/v11/install-2')
+  getHashLink
+    .mockReturnValueOnce('/global/v11/hash-foo')
+    .mockReturnValueOnce('/global/v11/hash-bar')
+  const groups = [
+    {
+      dependencies: { foo: '^1.0.0' },
+      hash: 'hash-foo',
+      installDir: '/global/v11/old-foo',
+    },
+    {
+      dependencies: { bar: '^2.0.0' },
+      hash: 'hash-bar',
+      installDir: '/global/v11/old-bar',
+    },
+  ]
+  scanGlobalPackages.mockReturnValue(groups)
+
+  await handleGlobalUpdate({
+    bin: '/global/bin',
+    globalPkgDir: '/global/v11',
+    updateResolutionPolicyManifest,
+  } as any, [], {}) // eslint-disable-line @typescript-eslint/no-explicit-any
+
+  expect(installGlobalPackages).toHaveBeenCalledTimes(2)
+  expect(installGlobalPackages).toHaveBeenNthCalledWith(
+    1,
+    expect.objectContaining({
+      dir: '/global/v11/install-1',
+      global: false,
+      omitSummaryLog: true,
+    }),
+    ['foo@^1.0.0']
+  )
+  expect(installGlobalPackages).toHaveBeenNthCalledWith(
+    2,
+    expect.objectContaining({
+      dir: '/global/v11/install-2',
+      global: false,
+      omitSummaryLog: true,
+    }),
+    ['bar@^2.0.0']
+  )
+  expect(activateGlobalInstall).toHaveBeenNthCalledWith(1, {
+    installDir: '/global/v11/install-1',
+    hashLink: '/global/v11/hash-foo',
+    globalBinDir: '/global/bin',
+    pkgs: [],
+    binsToSkip: new Set(),
+  })
+  expect(activateGlobalInstall).toHaveBeenNthCalledWith(2, {
+    installDir: '/global/v11/install-2',
+    hashLink: '/global/v11/hash-bar',
+    globalBinDir: '/global/bin',
+    pkgs: [],
+    binsToSkip: new Set(),
+  })
+  expect(cleanupReplacedGlobalInstalls).toHaveBeenNthCalledWith(1, {
+    groups: [groups[0]],
+    globalDir: '/global/v11',
+    globalBinDir: '/global/bin',
+    activeHash: 'hash-foo',
+    activatedBins: new Set(['fresh']),
+    protectedBins: new Set(),
+  })
+  expect(cleanupReplacedGlobalInstalls).toHaveBeenNthCalledWith(2, {
+    groups: [groups[1]],
+    globalDir: '/global/v11',
+    globalBinDir: '/global/bin',
+    activeHash: 'hash-bar',
+    activatedBins: new Set(['fresh']),
+    protectedBins: new Set(),
+  })
+  for (const index of [0, 1]) {
+    expect(activateGlobalInstall.mock.invocationCallOrder[index]).toBeLessThan(cleanupReplacedGlobalInstalls.mock.invocationCallOrder[index])
+    expect(cleanupReplacedGlobalInstalls.mock.invocationCallOrder[index]).toBeLessThan(updateResolutionPolicyManifest.mock.invocationCallOrder[index])
+  }
+  expect(summaryDebug).toHaveBeenCalledTimes(1)
+  expect(summaryDebug).toHaveBeenCalledWith({ prefix: '/global/v11' })
+})
+
+test('global update only updates interactively selected groups', async () => {
+  createInstallDir.mockReturnValue('/global/v11/install-1')
+  getHashLink.mockReturnValue('/global/v11/hash-foo')
+  scanGlobalPackages.mockReturnValue([
+    {
+      dependencies: { foo: '^1.0.0' },
+      hash: 'hash-foo',
+      installDir: '/global/v11/old-foo',
+    },
+    {
+      dependencies: { bar: '^2.0.0' },
+      hash: 'hash-bar',
+      installDir: '/global/v11/old-bar',
+    },
+  ])
+
+  await handleGlobalUpdate({
+    bin: '/global/bin',
+    globalPkgDir: '/global/v11',
+    selectedPackageHashes: new Set(['hash-foo']),
+  } as any, [], {}) // eslint-disable-line @typescript-eslint/no-explicit-any
+
+  expect(installGlobalPackages).toHaveBeenCalledTimes(1)
+  expect(installGlobalPackages).toHaveBeenCalledWith(
+    expect.objectContaining({ dir: '/global/v11/install-1' }),
+    ['foo@^1.0.0']
+  )
+})
+
+test('global update does not clean up or persist policy when activation fails', async () => {
+  const group = {
+    dependencies: { foo: '^1.0.0' },
+    hash: 'hash-foo',
+    installDir: '/global/v11/old-foo',
+  }
+  const activationError = new Error('activation failed')
+  const updateResolutionPolicyManifest = jest.fn<() => Promise<void>>().mockResolvedValue(undefined)
+  createInstallDir.mockReturnValue('/global/v11/install-1')
+  getHashLink.mockReturnValue('/global/v11/hash-foo')
+  scanGlobalPackages.mockReturnValue([group])
+  activateGlobalInstall.mockRejectedValue(activationError)
+
+  await expect(handleGlobalUpdate({
+    bin: '/global/bin',
+    globalPkgDir: '/global/v11',
+    updateResolutionPolicyManifest,
+  } as any, [], {})).rejects.toBe(activationError) // eslint-disable-line @typescript-eslint/no-explicit-any
+
+  expect(cleanupReplacedGlobalInstalls).not.toHaveBeenCalled()
+  expect(updateResolutionPolicyManifest).not.toHaveBeenCalled()
+})
+
+test('global update --latest drops the spec only of plain version dependencies', async () => {
+  createInstallDir.mockReturnValueOnce('/global/v11/install-3')
+  getHashLink.mockReturnValueOnce('/global/v11/hash-local')
+  scanGlobalPackages.mockReturnValue([
+    {
+      dependencies: {
+        'private-linked-pkg': 'link:/home/user/projects/private-linked-pkg',
+        'local-tarball-pkg': 'file:/home/user/tarballs/local-tarball-pkg.tgz',
+        'git-pkg': 'github:user/git-pkg',
+        'remote-tarball-pkg': 'https://example.com/pkg.tgz',
+        'aliased-pkg': 'npm:other-pkg@^2.0.0',
+        'named-registry-pkg': 'gh:^3.0.0',
+        foo: '^1.0.0',
+        bar: 'next',
+      },
+      hash: 'hash-local',
+      installDir: '/global/v11/old-local',
+    },
+  ])
+
+  await handleGlobalUpdate({
+    bin: '/global/bin',
+    globalPkgDir: '/global/v11',
+    latest: true,
+  } as any, [], {}) // eslint-disable-line @typescript-eslint/no-explicit-any
+
+  expect(installGlobalPackages).toHaveBeenCalledTimes(1)
+  expect(installGlobalPackages).toHaveBeenCalledWith(
+    expect.objectContaining({
+      dir: '/global/v11/install-3',
+      global: false,
+      omitSummaryLog: true,
+    }),
+    [
+      'private-linked-pkg@link:/home/user/projects/private-linked-pkg',
+      'local-tarball-pkg@file:/home/user/tarballs/local-tarball-pkg.tgz',
+      'git-pkg@github:user/git-pkg',
+      'remote-tarball-pkg@https://example.com/pkg.tgz',
+      'aliased-pkg@npm:other-pkg@^2.0.0',
+      'named-registry-pkg@gh:^3.0.0',
+      'foo',
+      'bar',
+    ]
+  )
+})
+
+// `pnpm self-update` owns the pnpm CLI's global install: it is what points the
+// pnpm home's bins at a release. Updating that group here would resolve pnpm
+// from the `latest` dist-tag and relink the bins, silently rolling the running
+// pnpm back to whatever `latest` points at (pnpm/pnpm#14270).
+test('global update leaves the pnpm CLI to self-update', async () => {
+  createInstallDir.mockReturnValueOnce('/global/v11/install-1')
+  getHashLink.mockReturnValueOnce('/global/v11/hash-foo')
+  scanGlobalPackages.mockReturnValue([
+    {
+      dependencies: { pnpm: '12.0.0' },
+      hash: 'hash-pnpm',
+      installDir: '/global/v11/old-pnpm',
+    },
+    {
+      dependencies: { '@pnpm/exe': '11.24.0' },
+      hash: 'hash-exe',
+      installDir: '/global/v11/old-exe',
+    },
+    {
+      dependencies: { foo: '^1.0.0' },
+      hash: 'hash-foo',
+      installDir: '/global/v11/old-foo',
+    },
+  ])
+
+  await handleGlobalUpdate({
+    bin: '/global/bin',
+    globalPkgDir: '/global/v11',
+    latest: true,
+  } as any, [], {}) // eslint-disable-line @typescript-eslint/no-explicit-any
+
+  expect(installGlobalPackages).toHaveBeenCalledTimes(1)
+  expect(installGlobalPackages).toHaveBeenCalledWith(
+    expect.objectContaining({ dir: '/global/v11/install-1' }),
+    ['foo']
+  )
+})
+
+test('global update reports nothing to do when only the pnpm CLI is installed globally', async () => {
+  scanGlobalPackages.mockReturnValue([
+    {
+      dependencies: { '@pnpm/exe': '11.24.0' },
+      hash: 'hash-exe',
+      installDir: '/global/v11/old-exe',
+    },
+  ])
+
+  const output = await handleGlobalUpdate({
+    bin: '/global/bin',
+    globalPkgDir: '/global/v11',
+  } as any, [], {}) // eslint-disable-line @typescript-eslint/no-explicit-any
+
+  expect(output).toBe('No global packages to update. Run "pnpm self-update" to update pnpm itself.')
+  expect(installGlobalPackages).not.toHaveBeenCalled()
+})
+
+// `--latest` resolves the `latest` dist-tag, which points at an older release
+// than the one installed whenever that came from another tag or from a major
+// that has not been promoted yet. An update must never move a package
+// backwards, so the group is reinstalled holding it where it is
+// (pnpm/pnpm#14270).
+test('global update --latest holds a package that latest would downgrade', async () => {
+  createInstallDir.mockReturnValueOnce('/global/v11/install-1')
+  getHashLink.mockReturnValue('/global/v11/hash-mixed')
+  scanGlobalPackages.mockReturnValue([
+    {
+      dependencies: { prerelease: '^2.0.0', stable: '^1.0.0' },
+      hash: 'hash-mixed',
+      installDir: '/global/v11/old-mixed',
+    },
+  ])
+  getGlobalPackageDetails.mockResolvedValue([
+    { alias: 'prerelease', version: '2.0.0' },
+    { alias: 'stable', version: '1.0.0' },
+  ])
+  installGlobalPackages.mockResolvedValue({
+    ignoredBuilds: undefined,
+    resolutionPolicyViolations: [],
+    resolvedVersions: { prerelease: '1.9.0', stable: '1.2.0' },
+  })
+
+  await handleGlobalUpdate({
+    bin: '/global/bin',
+    globalPkgDir: '/global/v11',
+    latest: true,
+  } as any, [], {}) // eslint-disable-line @typescript-eslint/no-explicit-any
+
+  // The probe resolves without installing, so a rejected release never gets to
+  // run its lifecycle scripts. It resolves into the group's own directory, so
+  // the install that follows reuses the lockfile it wrote.
+  expect(installGlobalPackages).toHaveBeenNthCalledWith(
+    1,
+    expect.objectContaining({ dir: '/global/v11/install-1', lockfileOnly: true }),
+    ['prerelease', 'stable']
+  )
+  // Only the one that went backwards is held; the other keeps its update.
+  expect(installGlobalPackages).toHaveBeenNthCalledWith(
+    2,
+    expect.objectContaining({ dir: '/global/v11/install-1', lockfileOnly: false }),
+    ['prerelease@2.0.0', 'stable']
+  )
+  expect(activateGlobalInstall).toHaveBeenCalledWith(
+    expect.objectContaining({ installDir: '/global/v11/install-1' })
+  )
+})
+
+test('global update without --latest resolves nothing up front', async () => {
+  createInstallDir.mockReturnValueOnce('/global/v11/install-1')
+  getHashLink.mockReturnValue('/global/v11/hash-foo')
+  scanGlobalPackages.mockReturnValue([
+    { dependencies: { foo: '^1.0.0' }, hash: 'hash-foo', installDir: '/global/v11/old-foo' },
+  ])
+  getGlobalPackageDetails.mockResolvedValue([{ alias: 'foo', version: '1.0.0' }])
+
+  await handleGlobalUpdate({
+    bin: '/global/bin',
+    globalPkgDir: '/global/v11',
+  } as any, [], {}) // eslint-disable-line @typescript-eslint/no-explicit-any
+
+  expect(installGlobalPackages).toHaveBeenCalledTimes(1)
+  expect(installGlobalPackages).toHaveBeenCalledWith(
+    expect.objectContaining({ dir: '/global/v11/install-1', lockfileOnly: false }),
+    ['foo@^1.0.0']
+  )
+})

@@ -1,0 +1,192 @@
+import { packageIsInstallable } from '@pnpm/config.package-is-installable'
+import { DepType, type DepTypes, detectDepTypes } from '@pnpm/lockfile.detect-dep-types'
+import type { LockfileObject, TarballResolution } from '@pnpm/lockfile.types'
+import { nameVerFromPkgSnapshot, packageIdFromSnapshot } from '@pnpm/lockfile.utils'
+import {
+  lockfileWalkerGroupImporterSteps,
+  type LockfileWalkerStep,
+} from '@pnpm/lockfile.walker'
+import { StoreIndex } from '@pnpm/store.index'
+import type { DependenciesField, ProjectId, RegistriesByScope, SupportedArchitectures } from '@pnpm/types'
+
+import { getPkgInfo } from './getPkgInfo.js'
+
+export interface LicenseNode {
+  name?: string
+  version?: string
+  /** Named-registry alias when the package came from one; see `LicensePackage.registryName`. */
+  registryName?: string
+  license: string
+  licenseContents?: string
+  dir: string
+  author?: string
+  homepage?: string
+  description?: string
+  repository?: string
+  integrity?: string
+  requires?: Record<string, string>
+  dependencies?: Record<string, LicenseNode>
+  dev: boolean
+}
+
+export type LicenseNodeTree = Omit<
+  LicenseNode,
+'dir' | 'license' | 'licenseContents' | 'author' | 'homepages' | 'repository'
+>
+
+export interface LicenseExtractOptions {
+  storeDir: string
+  storeIndex: StoreIndex
+  virtualStoreDir: string
+  virtualStoreDirMaxLength: number
+  modulesDir?: string
+  dir: string
+  registriesByScope: RegistriesByScope
+  registriesByPrefix?: Record<string, string>
+  supportedArchitectures?: SupportedArchitectures
+  depTypes: DepTypes
+}
+
+export async function lockfileToLicenseNode (
+  step: LockfileWalkerStep,
+  options: LicenseExtractOptions
+): Promise<Record<string, LicenseNode>> {
+  const dependencies: Record<string, LicenseNode> = Object.fromEntries(
+    (await Promise.all(step.dependencies.map(async (dependency): Promise<[string, LicenseNode] | null> => {
+      const { depPath, pkgSnapshot, next } = dependency
+      const { name, version, registryName } = nameVerFromPkgSnapshot(depPath, pkgSnapshot)
+
+      const packageInstallable = packageIsInstallable(pkgSnapshot.id ?? depPath, {
+        name,
+        version,
+        cpu: pkgSnapshot.cpu,
+        os: pkgSnapshot.os,
+        libc: pkgSnapshot.libc,
+      }, {
+        optional: pkgSnapshot.optional ?? false,
+        lockfileDir: options.dir,
+        supportedArchitectures: options.supportedArchitectures,
+      })
+
+      // If the package is not installable on the given platform, we ignore the
+      // package, typically the case for platform prebuild packages
+      if (!packageInstallable) {
+        return null
+      }
+
+      const packageInfo = await getPkgInfo(
+        {
+          id: packageIdFromSnapshot(depPath, pkgSnapshot),
+          name,
+          version,
+          depPath,
+          snapshot: pkgSnapshot,
+          registriesByScope: options.registriesByScope,
+          registriesByPrefix: options.registriesByPrefix,
+        },
+        {
+          storeDir: options.storeDir,
+          storeIndex: options.storeIndex,
+          virtualStoreDir: options.virtualStoreDir,
+          virtualStoreDirMaxLength: options.virtualStoreDirMaxLength,
+          dir: options.dir,
+          modulesDir: options.modulesDir ?? 'node_modules',
+          supportedArchitectures: options.supportedArchitectures,
+        }
+      )
+
+      const subdeps = await lockfileToLicenseNode(next(), options)
+
+      const dep: LicenseNode = {
+        name,
+        registryName,
+        dev: options.depTypes[depPath] === DepType.DevOnly,
+        integrity: (pkgSnapshot.resolution as TarballResolution).integrity,
+        version,
+        license: packageInfo.license,
+        licenseContents: packageInfo.licenseContents,
+        author: packageInfo.author,
+        homepage: packageInfo.homepage,
+        description: packageInfo.description,
+        repository: packageInfo.repository,
+        dir: packageInfo.path as string,
+      }
+
+      if (Object.keys(subdeps).length > 0) {
+        dep.dependencies = subdeps
+        dep.requires = toRequires(subdeps)
+      }
+
+      // If the package details could be fetched, we consider it part of the tree
+      return [depPath, dep]
+    }))).filter(Boolean) as Array<[string, LicenseNode]>
+  )
+
+  return dependencies
+}
+
+/**
+ * Reads the lockfile and converts it in a node tree of information necessary
+ * to generate the licenses summary
+ * @param lockfile the lockfile to process
+ * @param opts     parsing instructions
+ * @returns
+ */
+export async function lockfileToLicenseNodeTree (
+  lockfile: LockfileObject,
+  opts: {
+    include?: { [dependenciesField in DependenciesField]: boolean }
+    includedImporterIds?: ProjectId[]
+  } & Omit<LicenseExtractOptions, 'storeIndex'>
+): Promise<LicenseNodeTree> {
+  const importerWalkers = lockfileWalkerGroupImporterSteps(
+    lockfile,
+    opts.includedImporterIds ?? Object.keys(lockfile.importers) as ProjectId[],
+    { include: opts?.include }
+  )
+  const depTypes = detectDepTypes(lockfile)
+  const storeIndex = new StoreIndex(opts.storeDir)
+  const dependencies = Object.fromEntries(
+    await Promise.all(
+      importerWalkers.map(async (importerWalker) => {
+        const importerDeps = await lockfileToLicenseNode(importerWalker.step, {
+          storeDir: opts.storeDir,
+          storeIndex,
+          virtualStoreDir: opts.virtualStoreDir,
+          virtualStoreDirMaxLength: opts.virtualStoreDirMaxLength,
+          modulesDir: opts.modulesDir,
+          dir: opts.dir,
+          registriesByScope: opts.registriesByScope,
+          registriesByPrefix: opts.registriesByPrefix,
+          supportedArchitectures: opts.supportedArchitectures,
+          depTypes,
+        })
+        return [importerWalker.importerId, {
+          dependencies: importerDeps,
+          requires: toRequires(importerDeps),
+          version: '0.0.0',
+          license: undefined,
+        }]
+      })
+    )
+  )
+  storeIndex.close()
+
+  const licenseNodeTree: LicenseNodeTree = {
+    name: undefined,
+    version: undefined,
+    dependencies,
+    dev: false,
+    integrity: undefined,
+    requires: toRequires(dependencies),
+  }
+
+  return licenseNodeTree
+}
+
+function toRequires (licenseNodes: Record<string, LicenseNode>): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(licenseNodes)
+      .map(([key, licenseNode]) => [licenseNode.name ?? key, licenseNode.version!])
+  )
+}

@@ -1,0 +1,69 @@
+import { WANTED_LOCKFILE } from '@pnpm/constants'
+import { LockfileMissingDependencyError } from '@pnpm/error'
+import type {
+  LockfileObject,
+  PackageSnapshots,
+} from '@pnpm/lockfile.types'
+import { lockfileWalker, type LockfileWalkerStep } from '@pnpm/lockfile.walker'
+import { logger } from '@pnpm/logger'
+import type { DependenciesField, DepPath, ProjectId } from '@pnpm/types'
+
+import { filterImporter } from './filterImporter.js'
+
+const lockfileLogger = logger('lockfile')
+
+export function filterLockfileByImporters (
+  lockfile: LockfileObject,
+  importerIds: ProjectId[],
+  opts: {
+    include: { [dependenciesField in DependenciesField]: boolean }
+    skipped: Set<DepPath>
+    skipRuntimes?: boolean
+    failOnMissingDependencies: boolean
+  }
+): LockfileObject {
+  const importers = { ...lockfile.importers }
+  for (const importerId of importerIds) {
+    importers[importerId] = filterImporter(lockfile.importers[importerId], opts.include, { skipRuntimes: opts.skipRuntimes })
+  }
+
+  const packages = {} as PackageSnapshots
+  if (lockfile.packages != null) {
+    pkgAllDeps(
+      lockfileWalker(
+        { ...lockfile, importers },
+        importerIds,
+        { include: opts.include, skipped: opts.skipped }
+      ).step,
+      packages,
+      {
+        failOnMissingDependencies: opts.failOnMissingDependencies,
+      }
+    )
+  }
+
+  return {
+    ...lockfile,
+    importers,
+    packages,
+  }
+}
+
+function pkgAllDeps (
+  step: LockfileWalkerStep,
+  pickedPackages: PackageSnapshots,
+  opts: {
+    failOnMissingDependencies: boolean
+  }
+) {
+  for (const { pkgSnapshot, depPath, next } of step.dependencies) {
+    pickedPackages[depPath] = pkgSnapshot
+    pkgAllDeps(next(), pickedPackages, opts)
+  }
+  for (const depPath of step.missing) {
+    if (opts.failOnMissingDependencies) {
+      throw new LockfileMissingDependencyError(depPath)
+    }
+    lockfileLogger.debug(`No entry for "${depPath}" in ${WANTED_LOCKFILE}`)
+  }
+}

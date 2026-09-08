@@ -1,0 +1,1327 @@
+mod auth;
+mod limited_body;
+mod priority_semaphore;
+mod proxy;
+mod retry;
+#[cfg(test)]
+mod tests;
+mod tls;
+mod token_helper;
+
+pub use auth::{
+    AuthHeaders, AuthHeadersByScope, DEFAULT_REGISTRY_SCOPE, MetadataCacheScope, UpstreamRouteHook,
+    base64_encode, base64_encode_bytes, hide_auth_information, is_url_secure_for_credentials,
+    nerf_dart, normalize_auth_key, redact_and_sanitize, redact_and_sanitize_multiline,
+    redact_url_credentials, redact_url_for_display,
+};
+pub use limited_body::{LimitedBody, read_limited_body};
+pub use token_helper::{TokenHelperOutput, TokenHelperRunner};
+pub use url_encoding::{encode_package_name, encode_uri_component, percent_decode_str};
+
+mod url_encoding;
+pub use proxy::{NoProxySetting, ProxyConfig, ProxyError};
+pub use retry::{
+    RetryOpts, retry_async, send_with_retry, send_with_retry_at_priority, should_retry_status,
+};
+pub use tls::{PerRegistryTls, RegistryTls, TlsConfig, TlsError};
+
+use priority_semaphore::{Permit, PrioritySemaphore};
+use proxy::{NoProxyMatcher, parse_proxy_url, strip_userinfo};
+use reqwest::{
+    Certificate, Client, Identity, Proxy,
+    dns::{Addrs, Name, Resolve, Resolving},
+    header::{HeaderMap, HeaderValue, USER_AGENT},
+};
+use std::{
+    collections::HashMap,
+    num::NonZeroUsize,
+    ops::Deref,
+    sync::{Arc, LazyLock, Mutex},
+    time::{Duration, Instant},
+};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+/// Fallback `User-Agent` for the install client's no-config
+/// constructors ([`ThrottledClient::new_for_installs`]) and for the case where a
+/// configured user-agent string cannot be encoded as an HTTP header
+/// value.
+///
+/// Production installs override this with the value resolved by
+/// `pnpm-config` (`userAgent`, defaulting to the
+/// `pnpm/<version> npm/? node/? <platform> <arch>` format). The leading
+/// `pnpm` token is what UA-keyed allow / rate-limit rules expect, so any
+/// rule that lets pnpm through also lets this build through.
+///
+/// A default `reqwest::Client` sends *no* User-Agent at all, which
+/// some registry CDNs and corporate WAFs treat as a bot signature and
+/// either block at the edge or terminate mid-handshake (surfacing as a
+/// generic "error sending request for url" with no body to look at).
+/// The install client therefore always sends one.
+pub const DEFAULT_USER_AGENT: &str = "pnpm";
+
+/// Permit priority used by [`ThrottledClient::acquire`] /
+/// [`ThrottledClient::acquire_for_url`] for callers that don't pass an
+/// explicit one. Marks the request as latency class — packument and
+/// other metadata fetches that gate resolution progress — served FIFO
+/// and preferred over size-prioritized downloads beyond the downloads'
+/// reserved share of the pool (see the `priority_semaphore` module
+/// docs for the two-class grant policy).
+pub const UNPRIORITIZED: u64 = u64::MAX;
+
+/// Priority sentinel for the background class: metadata fetches whose
+/// deadline is the end of the install rather than the next resolution
+/// step — the lockfile-verification fan-out. A background request is
+/// granted a slot only when no [`UNPRIORITIZED`] (latency-class)
+/// request is queued, so bulk verification never queue-jumps the
+/// resolver's critical-path packument fetches (see the
+/// `priority_semaphore` module docs for the full grant policy).
+pub const BACKGROUND: u64 = u64::MAX - 1;
+
+/// Highest priority a throughput-class (download) request may carry.
+/// Callers that derive a priority from untrusted size hints must clamp
+/// to this, so a saturated estimate can never collide with the
+/// [`BACKGROUND`] or [`UNPRIORITIZED`] sentinels and change the
+/// request's class.
+pub const MAX_THROUGHPUT_PRIORITY: u64 = BACKGROUND - 1;
+
+/// Default network-inactivity timeout in milliseconds: the
+/// `fetchTimeout` default of `60000`. Source of truth for
+/// `pnpm-config`'s `default_fetch_timeout`.
+pub const DEFAULT_FETCH_TIMEOUT_MS: u64 = 60_000;
+
+/// Default slow-metadata-request warning threshold in milliseconds: the
+/// `fetchWarnTimeoutMs` default of `10000`.
+pub const DEFAULT_FETCH_WARN_TIMEOUT_MS: u64 = 10_000;
+
+/// Default minimum average tarball download speed in KiB/s: the
+/// `fetchMinSpeedKiBps` default of `50`.
+pub const DEFAULT_FETCH_MIN_SPEED_KI_BPS: u64 = 50;
+
+/// Tunable network knobs threaded into the install client: the
+/// `networkConcurrency`, `fetchTimeout`, `fetchWarnTimeoutMs`,
+/// `fetchMinSpeedKiBps`, and `userAgent` settings.
+/// `pnpm-config` owns their defaults and override sources
+/// (`pnpm-workspace.yaml`, `PNPM_CONFIG_*`, CLI flags) and hands the
+/// resolved values here.
+#[derive(Debug, Clone)]
+pub struct NetworkSettings {
+    /// Maximum number of concurrent in-flight network requests — the
+    /// semaphore size. Default: [`default_network_concurrency`].
+    pub network_concurrency: usize,
+
+    /// How long a request may make no progress before it fails, applied
+    /// as both reqwest's read timeout and its connect timeout. A
+    /// download that keeps receiving data runs as long as it needs.
+    /// Default: [`DEFAULT_FETCH_TIMEOUT_MS`].
+    pub fetch_timeout: Duration,
+
+    /// Successful metadata requests slower than this emit a warning.
+    /// Default: [`DEFAULT_FETCH_WARN_TIMEOUT_MS`].
+    pub fetch_warn_timeout: Duration,
+
+    /// Successful tarball downloads whose average speed falls below this
+    /// value emit a warning. Default: [`DEFAULT_FETCH_MIN_SPEED_KI_BPS`].
+    pub fetch_min_speed_ki_bps: u64,
+
+    /// Value of the `User-Agent` header sent on every request.
+    /// Default: [`DEFAULT_USER_AGENT`].
+    pub user_agent: String,
+}
+
+impl Default for NetworkSettings {
+    fn default() -> Self {
+        NetworkSettings {
+            network_concurrency: default_network_concurrency(),
+            fetch_timeout: Duration::from_millis(DEFAULT_FETCH_TIMEOUT_MS),
+            fetch_warn_timeout: Duration::from_millis(DEFAULT_FETCH_WARN_TIMEOUT_MS),
+            fetch_min_speed_ki_bps: DEFAULT_FETCH_MIN_SPEED_KI_BPS,
+            user_agent: DEFAULT_USER_AGENT.to_string(),
+        }
+    }
+}
+
+/// Wrapper around [`Client`] with a concurrent request limit enforced
+/// by a priority-ordered semaphore (`priority_semaphore` module).
+///
+/// Holds a default [`Client`] for the top-level proxy / TLS config
+/// plus an optional map of per-registry clients keyed by nerf-darted
+/// URI. [`Self::acquire_for_url`] picks the right client based on the
+/// request URL (a 5-step fallback), and [`Self::acquire`] always uses
+/// the default client. The semaphore is shared across both — bounding
+/// the total
+/// concurrent socket count regardless of which registry a request
+/// targets.
+///
+/// When the pool saturates, freed slots are granted by a two-class
+/// policy (see the `priority_semaphore` module docs): requests
+/// acquired without an explicit priority ([`Self::acquire`],
+/// [`Self::acquire_for_url`]) form the FIFO latency class (typically
+/// metadata fetches gating resolution progress), while downloads pass
+/// their estimated pipeline work through
+/// [`Self::acquire_for_url_with_priority`] and are guaranteed a
+/// reserved share of the pool, granted most-expensive-first — so the
+/// longest download jobs start early and neither class starves the
+/// other.
+#[derive(Debug)]
+pub struct ThrottledClient {
+    semaphore: PrioritySemaphore,
+    default_clients: ClientPair,
+    /// Per-registry clients keyed by nerf-darted URI. Empty when no
+    /// `//host/:cert=…` / `:key=…` / `:ca=…` / `:cafile=…` /
+    /// `:certfile=…` / `:keyfile=…` `.npmrc` entries are present —
+    /// in which case `acquire_for_url` short-circuits to the default
+    /// client without paying the routing cost.
+    per_registry: tls::PerRegistryMap<ClientPair>,
+    /// Per-origin socket cap (the `maxSockets` setting). `None` (the
+    /// default) leaves the per-origin socket count bounded only by
+    /// `semaphore`; see [`HostSocketLimit`].
+    host_socket_limit: Option<HostSocketLimit>,
+    fetch_warn_timeout: Duration,
+    fetch_min_speed_ki_bps: u64,
+    warning_handler: std::sync::RwLock<fn(&str)>,
+}
+
+#[derive(Debug)]
+struct ClientPair {
+    follow_redirects: Client,
+    no_redirects: Client,
+}
+
+impl ClientPair {
+    fn select(&self, follow_redirects: bool) -> &Client {
+        if follow_redirects { &self.follow_redirects } else { &self.no_redirects }
+    }
+}
+
+/// Per-origin concurrent-connection cap, mirroring undici's `connections`
+/// option (the `maxSockets` setting pnpm applies per registry origin).
+///
+/// Each distinct `scheme://host[:port]` origin gets its own [`Semaphore`] of
+/// `max` permits, minted on first request to that origin. Acquired *before*
+/// the global [`ThrottledClient::semaphore`] so a request waiting on a
+/// saturated origin does not hold a global concurrency slot — that would let a
+/// burst to one origin hoard every global permit and starve other origins.
+#[derive(Debug)]
+struct HostSocketLimit {
+    max: NonZeroUsize,
+    per_origin: Mutex<HashMap<String, Arc<Semaphore>>>,
+}
+
+impl HostSocketLimit {
+    /// Acquire an owned permit for `url`'s origin, or `None` when `url` has no
+    /// parseable `scheme://host` (in which case the request falls back to the
+    /// global concurrency bound alone).
+    async fn acquire(&self, url: &str) -> Option<OwnedSemaphorePermit> {
+        let origin = origin_of(url)?;
+        // Lock only long enough to look up (or mint) the origin's semaphore and
+        // clone its `Arc` — never held across the `.await` below.
+        let semaphore = {
+            let mut map = self.per_origin.lock().expect("host-socket-limit mutex poisoned");
+            Arc::clone(
+                map.entry(origin).or_insert_with(|| Arc::new(Semaphore::new(self.max.get()))),
+            )
+        };
+        Some(semaphore.acquire_owned().await.expect("host-socket semaphore is never closed"))
+    }
+}
+
+/// The `scheme://host[:port]` origin of `url`, or `None` when it has no host.
+/// `url` strips a scheme-default port while parsing (`https://host:443` parses
+/// with `port() == None`), so an explicit default and the implicit form map to
+/// the same origin key and a `:443` / `:80` variation cannot fragment the
+/// per-origin socket cap; a non-default port (`https://host:8443`) stays
+/// distinct — matching undici's per-origin keying.
+fn origin_of(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    Some(match parsed.port() {
+        Some(port) => format!("{}://{host}:{port}", parsed.scheme()),
+        None => format!("{}://{host}", parsed.scheme()),
+    })
+}
+
+/// RAII guard returned from [`ThrottledClient::acquire`]. Holds a
+/// semaphore permit alongside a reference to the underlying
+/// [`Client`]; the permit is released when the guard is dropped.
+///
+/// The guard derefs to [`Client`] so callers can chain
+/// `guard.get(url).send().await?.json().await?` (or any other
+/// reqwest method) directly. **Holding the guard across the body
+/// await is the point of the API.** A request's socket FD lives
+/// from `connect` all the way through body streaming; dropping the
+/// permit when `.send()` returns (right after headers arrive, with
+/// the body still pending) means the semaphore stops bounding the
+/// real concurrent socket count. Under `try_join_all` fan-out the
+/// next batch of permits then `connect()` while previous bodies are
+/// still draining, and the per-process FD count overruns the
+/// platform limit — surfacing as `EMFILE` "too many open files".
+pub struct ThrottledClientGuard<'a> {
+    permit: Permit,
+    /// The per-origin `maxSockets` permit, held for the same request lifetime
+    /// as `permit`. `None` when no `maxSockets` cap is configured or the URL
+    /// had no parseable origin.
+    host_permit: Option<OwnedSemaphorePermit>,
+    client: &'a Client,
+}
+
+/// A response that retains the global and per-origin permits through body reads.
+pub struct ThrottledResponse {
+    response: reqwest::Response,
+    _permit: Permit,
+    _host_permit: Option<OwnedSemaphorePermit>,
+    body_timeout: Duration,
+    received_at: Instant,
+}
+
+impl ThrottledClientGuard<'_> {
+    /// Transfer both concurrency permits to the response body owner.
+    #[must_use]
+    pub fn retain_for_body(
+        self,
+        response: reqwest::Response,
+        body_timeout: Duration,
+    ) -> ThrottledResponse {
+        ThrottledResponse {
+            response,
+            _permit: self.permit,
+            _host_permit: self.host_permit,
+            body_timeout,
+            received_at: Instant::now(),
+        }
+    }
+}
+
+impl ThrottledResponse {
+    pub async fn bytes(self) -> Result<bytes::Bytes, reqwest::Error> {
+        let Self { response, _permit, _host_permit, .. } = self;
+        response.bytes().await
+    }
+
+    /// Buffer at most one channel chunk. The producer deadline and cancellation
+    /// remain active even while the consumer stops polling the stream.
+    pub fn bytes_stream(
+        mut self,
+    ) -> impl futures_util::Stream<Item = std::io::Result<bytes::Bytes>> + Send {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let (completion_sender, completion) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let remaining = self.body_timeout.saturating_sub(self.received_at.elapsed());
+            let result = tokio::select! {
+                () = sender.closed() => Ok(()),
+                result = tokio::time::timeout(remaining, async {
+                    while let Some(chunk) = self.response.chunk().await.map_err(std::io::Error::other)? {
+                        if sender.send(chunk).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    Ok(())
+                }) => result.unwrap_or_else(|_| Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "upstream response body deadline exceeded",
+                ))),
+            };
+            drop(self);
+            let _ = completion_sender.send(result);
+        });
+        futures_util::stream::try_unfold(
+            (receiver, completion),
+            |(mut receiver, completion)| async move {
+                if let Some(chunk) = receiver.recv().await {
+                    return Ok(Some((chunk, (receiver, completion))));
+                }
+                completion.await.map_err(std::io::Error::other)??;
+                Ok::<_, std::io::Error>(None)
+            },
+        )
+    }
+}
+
+impl Deref for ThrottledResponse {
+    type Target = reqwest::Response;
+
+    fn deref(&self) -> &Self::Target {
+        &self.response
+    }
+}
+
+impl std::fmt::Debug for ThrottledResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ThrottledResponse")
+            .field("response", &self.response)
+            .field("body_timeout", &self.body_timeout)
+            .field("received_at", &self.received_at)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Deref for ThrottledClientGuard<'_> {
+    type Target = Client;
+
+    fn deref(&self) -> &Client {
+        self.client
+    }
+}
+
+impl ThrottledClient {
+    /// Replace the sink used by successful slow-fetch warnings.
+    pub fn set_warning_handler(&self, handler: fn(&str)) {
+        *self.warning_handler.write().expect("warning-handler lock poisoned") = handler;
+    }
+
+    /// Emit a successful slow-fetch warning through the configured sink.
+    pub fn warn(&self, message: &str) {
+        let handler = *self.warning_handler.read().expect("warning-handler lock poisoned");
+        handler(message);
+    }
+
+    /// The `fetchWarnTimeoutMs` threshold configured for this client.
+    pub fn fetch_warn_timeout(&self) -> Duration {
+        self.fetch_warn_timeout
+    }
+
+    /// The `fetchMinSpeedKiBps` threshold configured for this client.
+    pub fn fetch_min_speed_ki_bps(&self) -> u64 {
+        self.fetch_min_speed_ki_bps
+    }
+
+    /// Acquire a permit and return a guard granting access to the
+    /// underlying [`Client`]. The permit is released when the guard
+    /// is dropped, so callers control how long the request "counts"
+    /// against [`default_network_concurrency`] — typically the full
+    /// `send + body-consume` lifetime, not just `.send()`.
+    pub async fn acquire(&self) -> ThrottledClientGuard<'_> {
+        let permit = self.semaphore.acquire(UNPRIORITIZED).await;
+        ThrottledClientGuard {
+            permit,
+            host_permit: None,
+            client: &self.default_clients.follow_redirects,
+        }
+    }
+
+    /// Install a per-origin socket cap (the `maxSockets` setting) on this
+    /// client. `None` or `Some(0)` leaves the client uncapped — the per-origin
+    /// socket count then stays bounded only by the global concurrency
+    /// semaphore. Chained onto [`Self::for_installs`] at the install call
+    /// sites; the client's other constructors leave it uncapped.
+    #[must_use]
+    pub fn with_max_sockets_per_host(mut self, max_sockets: Option<usize>) -> Self {
+        self.host_socket_limit = max_sockets
+            .and_then(NonZeroUsize::new)
+            .map(|max| HostSocketLimit { max, per_origin: Mutex::new(HashMap::new()) });
+        self
+    }
+
+    /// Construct the default throttled client used for real installs.
+    ///
+    /// Network topology (see [#280](https://github.com/pnpm/pacquet/issues/280)):
+    ///
+    /// * **HTTP/1.1 only.** A default `reqwest::Client` upgrades to
+    ///   HTTP/2 via ALPN whenever the registry advertises it
+    ///   (registry.npmjs.org does). HTTP/2 is deliberately disabled —
+    ///   multiplexing many tarball streams over 1-2 TCP connections
+    ///   sharing one congestion window was slower than opening ~50
+    ///   independent HTTP/1.1 connections that each get their own
+    ///   congestion window and saturate bandwidth in parallel.
+    /// * **[`NetworkSettings::network_concurrency`] concurrent
+    ///   in-flight requests**, defaulting to the `networkConcurrency`
+    ///   formula (see [`default_network_concurrency`]). A 50-socket
+    ///   per-host pool ceiling bounds total sockets, while a smaller
+    ///   request-level cap bounds how many fetches actually run at once;
+    ///   pacquet's semaphore plays the second role.
+    /// * **A `User-Agent` header** ([`NetworkSettings::user_agent`],
+    ///   defaulting to [`DEFAULT_USER_AGENT`]). A default
+    ///   `reqwest::Client` sends no UA, which can trip CDN / WAF rules
+    ///   that reject or RST bot-shaped traffic before any HTTP response
+    ///   is produced.
+    ///
+    /// `pool_idle_timeout(4s)` matches
+    /// [`agentkeepalive`'s](https://github.com/node-modules/agentkeepalive/blob/1e5e312f36/lib/agent.js#L39-L41)
+    /// default `freeSocketTimeout` (the agent pnpm builds its
+    /// connection pool on top of). Most CDN / load-balancer edges in
+    /// front of `registry.npmjs.org` close idle sockets after 5–15s
+    /// without sending FIN that hyper notices; a pool TTL above that
+    /// lets pacquet reuse a half-dead socket and surface the next
+    /// request as a generic "error sending request for url". 4s
+    /// keeps the pool useful for back-to-back downloads (pacquet
+    /// runs hundreds of fetches in seconds) but well below the
+    /// typical edge keepalive.
+    ///
+    /// [`NetworkSettings::fetch_timeout`] bounds how long a request may
+    /// make no progress, not how long it may run. A default
+    /// `reqwest::Client` has no deadlines at all, so a stalled upstream
+    /// hangs the install indefinitely. It is applied as reqwest's read
+    /// timeout — which restarts on every chunk received — and as the
+    /// connect timeout. A total deadline would abort a healthy download
+    /// of a large archive over a slow link
+    /// ([#14604](https://github.com/pnpm/pnpm/issues/14604)). Default:
+    /// [`DEFAULT_FETCH_TIMEOUT_MS`] (60s), the `fetchTimeout` setting's
+    /// default.
+    ///
+    /// Hostnames resolve through the platform's `getaddrinfo` behind a
+    /// process-wide four-lookup cap shared by every client, matching
+    /// Node's libuv DNS pool. `configure_dns` documents why no pure-Rust
+    /// resolver is used on any platform.
+    #[must_use]
+    pub fn new_for_installs() -> Self {
+        Self::for_installs(
+            &ProxyConfig::default(),
+            &TlsConfig::default(),
+            &PerRegistryTls::default(),
+            &NetworkSettings::default(),
+        )
+        .expect("default proxy + TLS configs carry no URLs/PEMs and cannot fail")
+    }
+
+    /// Construct the install client with proxy + TLS configuration
+    /// applied onto reqwest:
+    /// * **Proxy routing.** HTTPS targets route through `https_proxy`,
+    ///   HTTP targets through `http_proxy`, and [`ProxyConfig::no_proxy`]
+    ///   short-circuits both via a per-URL custom-proxy closure.
+    ///   Basic-auth user/password halves embedded in the proxy URL
+    ///   are percent-decoded before being forwarded as the
+    ///   `Proxy-Authorization` header.
+    /// * **TLS.** Every certificate read out of [`TlsConfig::ca`] is
+    ///   added as a trusted root; material the TLS backend cannot read
+    ///   is skipped. When both [`TlsConfig::cert`] and
+    ///   [`TlsConfig::key`] are set and neither is blank, they are
+    ///   concatenated and passed to `Identity::from_pem` (rustls
+    ///   single-buffer form). rustls accepts PKCS#1, PKCS#8, and EC
+    ///   private keys — the same surface Node's `tls` exposes.
+    ///   `strict_ssl` defaults to `true` and disables both
+    ///   chain-of-trust and hostname verification when `false` — same
+    ///   as Node's `rejectUnauthorized=false` short-circuit.
+    /// * **`local_address`.** Pinned via
+    ///   `reqwest::ClientBuilder::local_address`.
+    /// * **Trust store.** The platform's, falling back to the Mozilla
+    ///   roots bundled into the binary when the platform verifier
+    ///   cannot be constructed (a system with no trust store at all).
+    ///
+    /// Returns [`ProxyError::InvalidProxy`] when either configured
+    /// proxy URL fails to parse even after the auto-`http://` prefix
+    /// retry (the `ERR_PNPM_INVALID_PROXY` code), or [`TlsError`] when
+    /// the client identity PEM is malformed. Unreadable CA material is
+    /// not an error — see [`TlsError`] for where that line sits.
+    pub fn for_installs(
+        proxy: &ProxyConfig,
+        tls: &TlsConfig,
+        per_registry: &PerRegistryTls,
+        settings: &NetworkSettings,
+    ) -> Result<Self, ForInstallsError> {
+        Self::for_installs_with_redirect(proxy, tls, per_registry, settings, None)
+    }
+
+    /// Like [`Self::for_installs`] with an optional redirect guard.
+    /// Pass `Some(guard)` to restrict which redirect targets are followed;
+    /// `None` gives the default reqwest follow policy (same as [`Self::for_installs`]).
+    pub fn for_installs_with_guard(
+        proxy: &ProxyConfig,
+        tls: &TlsConfig,
+        per_registry: &PerRegistryTls,
+        settings: &NetworkSettings,
+        redirect_guard: Option<&RedirectGuard>,
+    ) -> Result<Self, ForInstallsError> {
+        Self::for_installs_with_redirect(proxy, tls, per_registry, settings, redirect_guard)
+    }
+
+    /// Like [`Self::new_for_installs`] but installs `redirect_guard` as the
+    /// client's redirect policy: every redirect hop is re-validated by the
+    /// guard, and a hop it rejects fails the request without fetching. pnpr
+    /// resolves on behalf of untrusted callers, so it passes a guard that
+    /// re-checks each redirect target against its fetch allowlist — otherwise
+    /// an allowlisted registry could `302` pnpr onto an internal host, slipping
+    /// a server-side request past the request-boundary allowlist (SSRF). The
+    /// CLI fetches on the user's own behalf and keeps the default follow
+    /// policy via [`Self::new_for_installs`].
+    #[must_use]
+    pub fn new_for_installs_with_redirect_guard(
+        is_allowed: impl Fn(&reqwest::Url) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        let redirect_guard: RedirectGuard = Arc::new(is_allowed);
+        Self::for_installs_with_redirect(
+            &ProxyConfig::default(),
+            &TlsConfig::default(),
+            &PerRegistryTls::default(),
+            &NetworkSettings::default(),
+            Some(&redirect_guard),
+        )
+        .expect("default proxy + TLS configs carry no URLs/PEMs and cannot fail")
+    }
+
+    fn for_installs_with_redirect(
+        proxy: &ProxyConfig,
+        tls: &TlsConfig,
+        per_registry: &PerRegistryTls,
+        settings: &NetworkSettings,
+        redirect_guard: Option<&RedirectGuard>,
+    ) -> Result<Self, ForInstallsError> {
+        if settings.network_concurrency == 0 {
+            return Err(ForInstallsError::ZeroNetworkConcurrency);
+        }
+        // See the empty-value contract on `ProxyConfig`.
+        let https = proxy
+            .https_proxy
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .map(parse_proxy_url)
+            .transpose()?;
+        let http = proxy
+            .http_proxy
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .map(parse_proxy_url)
+            .transpose()?;
+        let no_proxy = Arc::new(NoProxyMatcher::from(proxy.no_proxy.as_ref()));
+        // Read once here, not inside `build_client`: `for_installs`
+        // builds one client per per-registry override, so loading the
+        // bundle per call would re-read and re-parse it N times.
+        let extra_ca_certs = load_node_extra_ca_certs();
+
+        let make_builder = |effective_tls: &TlsConfig,
+                            trust_roots: TrustRoots,
+                            forbid_redirects: bool|
+         -> Result<reqwest::ClientBuilder, ForInstallsError> {
+            let mut builder = default_client_builder(settings);
+            if let Some(url) = https.clone() {
+                builder = builder.proxy(build_scheme_proxy(url, "https", Arc::clone(&no_proxy)));
+            }
+            if let Some(url) = http.clone() {
+                builder = builder.proxy(build_scheme_proxy(url, "http", Arc::clone(&no_proxy)));
+            }
+            // Lowest-priority additive roots; `apply_tls` layers the
+            // `.npmrc` ca/cafile roots on top next.
+            for cert in &extra_ca_certs {
+                builder = builder.add_root_certificate(cert.clone());
+            }
+            builder = apply_tls(builder, effective_tls)?;
+            if trust_roots == TrustRoots::Bundled {
+                builder = builder.tls_certs_only(bundled_root_certs().iter().cloned());
+            }
+            if let Some(guard) = redirect_guard {
+                builder = builder
+                    .redirect(allowlist_redirect_policy(Arc::clone(guard), !forbid_redirects));
+            } else if forbid_redirects {
+                builder = builder.redirect(reqwest::redirect::Policy::none());
+            }
+            Ok(builder)
+        };
+
+        let build_client = |effective_tls: &TlsConfig,
+                            forbid_redirects: bool|
+         -> Result<Client, ForInstallsError> {
+            match make_builder(effective_tls, TrustRoots::Platform, forbid_redirects)?.build() {
+                Ok(client) => Ok(client),
+                Err(platform) => {
+                    make_builder(effective_tls, TrustRoots::Bundled, forbid_redirects)?
+                        .build()
+                        .map_err(|bundled| ForInstallsError::ClientBuild { platform, bundled })
+                }
+            }
+        };
+
+        let default_clients = ClientPair {
+            follow_redirects: build_client(tls, false)?,
+            no_redirects: build_client(tls, true)?,
+        };
+        // Build one client per per-registry override. Each gets a
+        // merged `TlsConfig` where the per-registry fields shadow
+        // their top-level counterparts field-by-field. `strict_ssl` and
+        // `local_address` are top-level-only, so the per-registry client
+        // still honors the top-level values.
+        let per_registry = per_registry.try_map(|override_| -> Result<_, ForInstallsError> {
+            let merged = merge_tls(tls, override_);
+            Ok(ClientPair {
+                follow_redirects: build_client(&merged, false)?,
+                no_redirects: build_client(&merged, true)?,
+            })
+        })?;
+
+        Ok(ThrottledClient {
+            semaphore: PrioritySemaphore::new(settings.network_concurrency),
+            default_clients,
+            per_registry,
+            host_socket_limit: None,
+            fetch_warn_timeout: settings.fetch_warn_timeout,
+            fetch_min_speed_ki_bps: settings.fetch_min_speed_ki_bps,
+            warning_handler: std::sync::RwLock::new(ignore_warning),
+        })
+    }
+
+    /// Construct a throttled client wrapping aligned pre-built clients.
+    /// `client_without_redirects` must carry the same TLS, proxy, timeout,
+    /// headers, and protocol settings as `client`, differing only in its
+    /// redirect policy.
+    #[must_use]
+    pub fn from_clients(client: Client, client_without_redirects: Client) -> Self {
+        let semaphore = PrioritySemaphore::new(default_network_concurrency());
+        ThrottledClient {
+            semaphore,
+            default_clients: ClientPair {
+                follow_redirects: client,
+                no_redirects: client_without_redirects,
+            },
+            per_registry: tls::PerRegistryMap::default(),
+            host_socket_limit: None,
+            fetch_warn_timeout: Duration::from_millis(DEFAULT_FETCH_WARN_TIMEOUT_MS),
+            fetch_min_speed_ki_bps: DEFAULT_FETCH_MIN_SPEED_KI_BPS,
+            warning_handler: std::sync::RwLock::new(ignore_warning),
+        }
+    }
+
+    /// Acquire a permit and return a guard granting access to the
+    /// per-registry [`Client`] that matches `url`'s nerf-darted form
+    /// (falling back to the default client when no override matches).
+    /// The semaphore is shared across all clients, so total concurrent
+    /// socket count stays bounded by [`default_network_concurrency`]
+    /// regardless of which registry the request targets.
+    ///
+    /// Per-URL routing uses a 5-step fallback: exact, then nerf-darted,
+    /// then host without port, then progressively shorter path prefixes,
+    /// then a recursive retry without port. When no per-registry overrides
+    /// are configured (the common case), the routing table is empty
+    /// and the lookup short-circuits to the default client.
+    ///
+    /// Takes `url` as `&str` so callers don't have to round-trip
+    /// `format!("{registry}{name}")` strings through `Url::parse`
+    /// just to satisfy the type signature — the lookup itself works
+    /// on the raw string form.
+    pub async fn acquire_for_url(&self, url: &str) -> ThrottledClientGuard<'_> {
+        self.acquire_for_url_with_priority(url, UNPRIORITIZED).await
+    }
+
+    /// [`Self::acquire_for_url`], but queueing behind the saturated
+    /// pool at an explicit `priority` instead of [`UNPRIORITIZED`].
+    /// [`BACKGROUND`] selects the background class (bulk verification
+    /// metadata); any other value selects the throughput class.
+    /// Tarball downloads pass their estimated pipeline work (0 when
+    /// unknown) so that freed slots go to the most expensive pending
+    /// archive first — the longest download+extract jobs start
+    /// earliest and never end up running alone after the small ones
+    /// drained.
+    pub async fn acquire_for_url_with_priority(
+        &self,
+        url: &str,
+        priority: u64,
+    ) -> ThrottledClientGuard<'_> {
+        self.acquire_for_url_with_priority_and_redirects(url, priority, true).await
+    }
+
+    /// [`Self::acquire_for_url_with_priority`] using a client that returns the
+    /// first redirect response instead of following it.
+    pub async fn acquire_for_url_without_redirects_with_priority(
+        &self,
+        url: &str,
+        priority: u64,
+    ) -> ThrottledClientGuard<'_> {
+        self.acquire_for_url_with_priority_and_redirects(url, priority, false).await
+    }
+
+    /// Send a GET whose URL-scoped credentials are re-evaluated for every
+    /// redirect target. Credentials are limited to TLS and loopback URLs by
+    /// [`AuthHeaders::for_secure_url`].
+    pub async fn get_bytes_with_secure_auth_headers(
+        &self,
+        url: &str,
+        auth_headers: &AuthHeaders,
+    ) -> Result<SecureAuthResponse, reqwest::Error> {
+        self.get_bytes_with_secure_auth_and_accept(url, auth_headers, None).await
+    }
+
+    /// Retry a complete authenticated GET, including redirects and body reads.
+    /// Each attempt re-evaluates credentials and releases permits before backoff.
+    pub async fn get_bytes_with_secure_auth_and_retry(
+        &self,
+        url: &str,
+        auth_headers: &AuthHeaders,
+        accept: Option<&str>,
+        retry_opts: RetryOpts,
+    ) -> Result<SecureAuthResponse, reqwest::Error> {
+        self.get_limited_bytes_with_secure_auth_and_retry(
+            url,
+            auth_headers,
+            accept,
+            retry_opts,
+            usize::MAX,
+        )
+        .await
+    }
+
+    /// An authenticated GET with a byte limit on the final response, including
+    /// error responses. Oversized bodies are marked by [`SecureAuthResponse::body_truncated`]
+    /// and are not retried.
+    pub async fn get_limited_bytes_with_secure_auth_and_retry(
+        &self,
+        url: &str,
+        auth_headers: &AuthHeaders,
+        accept: Option<&str>,
+        retry_opts: RetryOpts,
+        body_limit: usize,
+    ) -> Result<SecureAuthResponse, reqwest::Error> {
+        retry::get_secure_bytes(self, url, auth_headers, accept, retry_opts, body_limit).await
+    }
+
+    /// Negotiate an ecosystem's metadata representation while retaining the
+    /// shared request budget and URL-scoped authorization on redirects.
+    pub async fn get_bytes_with_secure_auth_and_accept(
+        &self,
+        url: &str,
+        auth_headers: &AuthHeaders,
+        accept: Option<&str>,
+    ) -> Result<SecureAuthResponse, reqwest::Error> {
+        self.get_limited_bytes_with_secure_auth_and_accept(url, auth_headers, accept, usize::MAX)
+            .await
+    }
+
+    async fn get_limited_bytes_with_secure_auth_and_accept(
+        &self,
+        url: &str,
+        auth_headers: &AuthHeaders,
+        accept: Option<&str>,
+        body_limit: usize,
+    ) -> Result<SecureAuthResponse, reqwest::Error> {
+        let (response, _guard) = self
+            .get_response_with_scoped_headers(url, |mut request, url| {
+                if let Some(accept) = accept {
+                    request = request.header(reqwest::header::ACCEPT, accept);
+                }
+                if let Some(authorization) = auth_headers.for_secure_url(url) {
+                    request = request.header("authorization", authorization);
+                }
+                request
+            })
+            .await?;
+        let status = response.status();
+        let url = response.url().to_string();
+        let body = read_limited_body(response, body_limit).await?;
+        Ok(SecureAuthResponse { status, body: body.bytes, body_truncated: body.truncated, url })
+    }
+
+    /// Follow a GET's redirects, rebuilding its headers for each destination.
+    /// The returned guard retains the request budget while the caller reads
+    /// the response body. Configured redirect guards apply at every hop.
+    pub async fn get_response_with_scoped_headers(
+        &self,
+        url: &str,
+        configure: impl Fn(reqwest::RequestBuilder, &str) -> reqwest::RequestBuilder,
+    ) -> Result<(reqwest::Response, ThrottledClientGuard<'_>), reqwest::Error> {
+        let mut current_url = url.to_string();
+        for redirect_count in 0..=MAX_REDIRECT_HOPS {
+            let client = self
+                .acquire_for_url_without_redirects_with_priority(&current_url, UNPRIORITIZED)
+                .await;
+            let request = configure(client.get(&current_url), &current_url);
+            let response = request.send().await?;
+            let target = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|location| location.to_str().ok())
+                .and_then(|location| response.url().join(location).ok());
+            if is_redirect_status(response.status())
+                && redirect_count < MAX_REDIRECT_HOPS
+                && let Some(target) = target
+            {
+                current_url = target.to_string();
+                continue;
+            }
+            return Ok((response, client));
+        }
+        unreachable!()
+    }
+
+    async fn acquire_for_url_with_priority_and_redirects(
+        &self,
+        url: &str,
+        priority: u64,
+        follow_redirects: bool,
+    ) -> ThrottledClientGuard<'_> {
+        // Acquire the per-origin `maxSockets` permit *before* the global
+        // concurrency permit: a request queued behind a saturated origin must
+        // not hold a global slot while it waits, or a burst to one origin would
+        // hoard every global permit and starve requests to other origins.
+        let host_permit = match &self.host_socket_limit {
+            Some(limit) => limit.acquire(url).await,
+            None => None,
+        };
+        let permit = self.semaphore.acquire(priority).await;
+        let clients = self.per_registry.pick_value_for_url(url).unwrap_or(&self.default_clients);
+        let client = clients.select(follow_redirects);
+        ThrottledClientGuard { permit, host_permit, client }
+    }
+}
+
+pub struct SecureAuthResponse {
+    pub status: reqwest::StatusCode,
+    pub body: Vec<u8>,
+    pub body_truncated: bool,
+    pub url: String,
+}
+
+fn ignore_warning(_: &str) {}
+
+/// Shared builder with the install-time defaults
+/// ([`ThrottledClient::new_for_installs`] documents the why behind each
+/// setting). Both `new_for_installs` and [`ThrottledClient::for_installs`]
+/// route through this helper so a single source of truth governs
+/// timeouts, HTTP-version, resolver, and the User-Agent header.
+///
+/// `settings.fetch_timeout` drives both the read timeout and the
+/// connect timeout, bounding how long a request may make no progress.
+/// `settings.user_agent` is sent verbatim; a value that cannot be
+/// encoded as an HTTP header falls back to [`DEFAULT_USER_AGENT`].
+/// A redirect-hop validator: returns `true` to follow a redirect to `url`,
+/// `false` to block it. See
+/// [`ThrottledClient::new_for_installs_with_redirect_guard`].
+pub type RedirectGuard = Arc<dyn Fn(&reqwest::Url) -> bool + Send + Sync>;
+
+/// Cap on redirect hops, matching reqwest's default `Policy::default()` limit
+/// so the guarded client doesn't follow a redirect chain further than the
+/// unguarded one would.
+const MAX_REDIRECT_HOPS: usize = 10;
+
+/// A redirect target the [`RedirectGuard`] rejected. Surfaced as the request
+/// error so a blocked redirect fails loudly rather than silently fetching.
+#[derive(Debug)]
+struct BlockedRedirect(reqwest::Url);
+
+impl std::fmt::Display for BlockedRedirect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Surface only `scheme://host[:port]` — never the path, query,
+        // fragment, or userinfo, where a presigned-URL signature/token could
+        // live. This error string can reach a client, so it must not leak the
+        // very credential the redirect was carrying.
+        write!(
+            f,
+            "redirect to {}://{}",
+            self.0.scheme(),
+            self.0.host_str().unwrap_or("<unknown>"),
+        )?;
+        if let Some(port) = self.0.port() {
+            write!(f, ":{port}")?;
+        }
+        write!(f, " is not allowed by the fetch allowlist")
+    }
+}
+
+impl std::error::Error for BlockedRedirect {}
+
+/// Validate every redirect before either following it or returning it to a
+/// manual redirect loop. Rejected targets fail with [`BlockedRedirect`].
+fn allowlist_redirect_policy(
+    guard: RedirectGuard,
+    follow_redirects: bool,
+) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| {
+        let target = attempt.url().clone();
+        if attempt.previous().len() >= MAX_REDIRECT_HOPS || !guard(&target) {
+            attempt.error(BlockedRedirect(target))
+        } else if follow_redirects {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    })
+}
+
+fn is_redirect_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308)
+}
+
+/// Caps concurrent lookups through `Inner`. Clones share the cap.
+#[derive(Clone)]
+struct CappedDnsResolver<Inner> {
+    inner: Arc<Inner>,
+    permits: Arc<Semaphore>,
+}
+
+#[derive(Clone)]
+struct NativeDnsResolver;
+
+impl Resolve for NativeDnsResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            tokio::net::lookup_host((host, 0))
+                .await
+                .map(|addrs| Box::new(addrs) as Addrs)
+                .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)
+        })
+    }
+}
+
+impl<Inner> CappedDnsResolver<Inner> {
+    fn new(inner: Inner, concurrency: NonZeroUsize) -> Self {
+        Self { inner: Arc::new(inner), permits: Arc::new(Semaphore::new(concurrency.get())) }
+    }
+}
+
+impl<Inner> Resolve for CappedDnsResolver<Inner>
+where
+    Inner: Resolve + 'static,
+{
+    fn resolve(&self, name: Name) -> Resolving {
+        let inner = Arc::clone(&self.inner);
+        let permits = Arc::clone(&self.permits);
+        Box::pin(async move {
+            let _permit =
+                permits.acquire_owned().await.expect("DNS concurrency semaphore is never closed");
+            inner.resolve(name).await
+        })
+    }
+}
+
+/// Resolve through the platform's `getaddrinfo`, capped at Node's libuv
+/// thread-pool width so `mDNSResponder` is not overloaded.
+///
+/// The system resolver is the only one that sees the whole host
+/// configuration, which is why Hickory's pure-Rust resolver is not used
+/// on any platform. macOS needs it for the scoped/supplemental resolver
+/// graph (VPN split DNS), which Hickory does not read. Windows needs it
+/// because Hickory sends every query from a freshly bound wildcard UDP
+/// socket, and Windows Defender Firewall treats that bind as a listener:
+/// it prompts the user to allow `pnpm.exe`, keyed on the executable's
+/// path, so every newly installed engine prompts again
+/// (pnpm/pnpm#14405). `getaddrinfo` hands the query to the Dnscache
+/// service and binds nothing in this process, and it also honors NRPT and
+/// per-adapter DNS settings. Linux needs it because Hickory parses
+/// `/etc/resolv.conf` itself and rejects the whole file over one option
+/// spelling glibc accepts (`no_tld_query`) or does not know yet, after
+/// which reqwest silently falls back to Google's public nameservers
+/// (pnpm/pnpm#14469). `getaddrinfo` also consults `nsswitch.conf`
+/// sources such as `nss-resolve` and `nss-mdns` that Hickory bypasses.
+fn configure_dns(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    builder.dns_resolver(native_dns_resolver())
+}
+
+#[must_use]
+pub fn native_dns_resolver() -> Arc<dyn Resolve> {
+    static RESOLVER: LazyLock<Arc<CappedDnsResolver<NativeDnsResolver>>> = LazyLock::new(|| {
+        const DNS_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(4).expect("four is non-zero");
+        Arc::new(CappedDnsResolver::new(NativeDnsResolver, DNS_CONCURRENCY))
+    });
+    Arc::clone(&RESOLVER) as Arc<dyn Resolve>
+}
+
+fn default_client_builder(settings: &NetworkSettings) -> reqwest::ClientBuilder {
+    let user_agent = HeaderValue::from_str(&settings.user_agent)
+        .unwrap_or_else(|_| HeaderValue::from_static(DEFAULT_USER_AGENT));
+    let mut default_headers = HeaderMap::with_capacity(1);
+    default_headers.insert(USER_AGENT, user_agent);
+    let builder = Client::builder()
+        .http1_only()
+        // Request gzip and transparently decompress it. Packuments are the
+        // largest payloads pulled during resolution and registries serve
+        // them gzipped; tarballs are unaffected (no `Content-Encoding`, so
+        // store-integrity verification still sees the raw `.tgz`). Defaults
+        // to on with reqwest's `gzip` feature, but set explicitly so the
+        // intent is visible and survives a change to that default.
+        .gzip(true)
+        .default_headers(default_headers)
+        .connect_timeout(settings.fetch_timeout)
+        .read_timeout(settings.fetch_timeout)
+        .pool_idle_timeout(Duration::from_secs(4));
+    configure_dns(builder)
+}
+
+/// Which trust anchors a client built by
+/// [`ThrottledClient::for_installs`] verifies registry certificates
+/// against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrustRoots {
+    /// The OS trust store, via reqwest's `rustls-platform-verifier`
+    /// backend. Picks up corporate / MITM roots an administrator
+    /// installed system-wide, which the bundled set cannot.
+    Platform,
+
+    /// The Mozilla root set compiled into the binary. Used only when
+    /// the platform verifier cannot be constructed at all — on a
+    /// machine with no system trust store, `rustls-platform-verifier`
+    /// fails the client build outright rather than degrading, and
+    /// pnpm-on-Node keeps working there because Node ships the same
+    /// bundled roots. Falling back restores that parity; it is never
+    /// preferred over the platform store, so a user who deliberately
+    /// distrusts a Mozilla root system-wide keeps that decision as
+    /// long as their store loads at all.
+    Bundled,
+}
+
+/// The Mozilla CA root set compiled into the binary, in reqwest's
+/// [`Certificate`] form. Parsed once — `for_installs` builds one
+/// client per per-registry override, and the fallback path is taken
+/// by every one of them on a system without a trust store.
+fn bundled_root_certs() -> &'static [Certificate] {
+    static CERTS: LazyLock<Vec<Certificate>> = LazyLock::new(|| {
+        webpki_root_certs::TLS_SERVER_ROOT_CERTS
+            .iter()
+            .map(|der| Certificate::from_der(der).expect("bundled Mozilla root is valid DER"))
+            .collect()
+    });
+    &CERTS
+}
+
+/// Load the PEM bundle named by `NODE_EXTRA_CA_CERTS` as extra trust
+/// roots, to be added to every client `for_installs` builds.
+///
+/// `NODE_EXTRA_CA_CERTS` is the standard Node convention for appending
+/// a CA to the default trust store. pnpm-on-Node inherits that trust
+/// implicitly because it runs inside Node; pacquet is a native binary,
+/// so to keep real-world parity for users behind a corporate MITM proxy
+/// it reads the variable explicitly. This is the one deliberate
+/// exception to the ".npmrc-only, no env vars" TLS parity policy
+/// documented in [`tls::TlsConfig`]: the variable is a process-global
+/// Node convention rather than a pnpm setting, and Node already honors
+/// it for pnpm today — so reading it *restores* parity rather than
+/// diverging from it. The certs are added in
+/// [`ThrottledClient::for_installs`] (not [`apply_tls`]) so the
+/// `.npmrc`-derived [`TlsConfig`] stays env-free.
+///
+/// Read and parsed once per [`ThrottledClient::for_installs`] call —
+/// that constructor builds one client per per-registry override, so
+/// loading here (rather than inside the per-client builder) avoids
+/// re-reading and re-parsing the bundle N times during startup.
+///
+/// The resulting certs are additive and lowest-priority: layered under
+/// the `.npmrc` `ca` / `cafile` roots that [`apply_tls`] adds afterward
+/// and under the platform trust store (ordering is immaterial — the
+/// rustls root store is a union). A missing, unreadable, or malformed
+/// file yields an empty list, matching pnpm's silent treatment of a
+/// missing `cafile` rather than failing the client build.
+fn load_node_extra_ca_certs() -> Vec<Certificate> {
+    let Some(path) = std::env::var_os("NODE_EXTRA_CA_CERTS").filter(|value| !value.is_empty())
+    else {
+        return Vec::new();
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Vec::new();
+    };
+    parse_ca_bundle(&bytes)
+}
+
+/// The certificates carried by one PEM buffer.
+///
+/// Material the TLS backend cannot read is skipped rather than
+/// rejected. Node ignores such material instead of refusing to open a
+/// TLS context, so pnpm 11 installs fine with an empty, truncated, or
+/// `${VAR}`-unresolved `ca=` value; pacquet drops the same material
+/// instead of failing the client build (pnpm/pnpm#14646).
+///
+/// `Certificate::from_pem_bundle` reads the buffer as a unit and fails
+/// it whole, so one corrupt block in a bundle would take the roots
+/// around it down with it. Falling back to a block-by-block read keeps
+/// every certificate that is readable on its own.
+fn parse_ca_bundle(pem: &[u8]) -> Vec<Certificate> {
+    if let Ok(certs) = Certificate::from_pem_bundle(pem) {
+        return certs;
+    }
+    String::from_utf8_lossy(pem)
+        .split_inclusive(END_CERTIFICATE)
+        .filter_map(|block| Certificate::from_pem_bundle(block.as_bytes()).ok())
+        .flatten()
+        .collect()
+}
+
+/// The PEM armor that closes a certificate. Splitting a bundle on it
+/// is how pnpm's own `cafile` reader delimits one certificate from the
+/// next.
+const END_CERTIFICATE: &str = "-----END CERTIFICATE-----";
+
+/// Build the effective [`TlsConfig`] for a per-registry override:
+/// each scoped field (`ca`, `cert`, `key`) replaces its top-level
+/// counterpart field-by-field; `strict_ssl` and `local_address`
+/// always come from the top-level (only `:cert(file)?` / `:key(file)?`
+/// / `:ca(file)?` are recognized as per-registry keys).
+///
+/// The `ca` field is special: a per-registry `ca` is stored as a
+/// single string that may contain multiple concatenated PEMs, while
+/// the top-level `ca` is a `Vec<String>` (the `cafile` loader split).
+/// When the override has a `ca`, the effective top-level CA list is
+/// *replaced* (not merged) by a one-element list with the scoped PEM
+/// blob — which [`parse_ca_bundle`] handles fine since it accepts
+/// multi-cert PEM buffers.
+fn merge_tls(top: &TlsConfig, override_: &RegistryTls) -> TlsConfig {
+    TlsConfig {
+        ca: match &override_.ca {
+            Some(pem) => vec![pem.clone()],
+            None => top.ca.clone(),
+        },
+        cert: override_.cert.clone().or_else(|| top.cert.clone()),
+        key: override_.key.clone().or_else(|| top.key.clone()),
+        strict_ssl: top.strict_ssl,
+        local_address: top.local_address,
+    }
+}
+
+/// Apply [`TlsConfig`] onto a [`reqwest::ClientBuilder`]: register each
+/// CA, install the client identity, set `danger_accept_invalid_certs`
+/// when `strict_ssl: false`, and pin the outbound interface. Returns
+/// the modified builder unchanged when every field is `None` / empty —
+/// matching pnpm's "TLS-unset is default-TLS" semantics.
+///
+/// `strict_ssl` defaults to `true` here (`unwrap_or(true)`) rather than
+/// in the config layer because that's where pnpm applies the same
+/// default — see the "Defaults" section of [`TlsConfig`]. A `cert` /
+/// `key` pair rustls rejects surfaces as
+/// [`TlsError::InvalidClientIdentity`] and bubbles through
+/// [`ForInstallsError`], the way Node throws from
+/// `tls.createSecureContext`. Unreadable `ca` material is dropped
+/// instead — see [`parse_ca_bundle`].
+fn apply_tls(
+    mut builder: reqwest::ClientBuilder,
+    tls: &TlsConfig,
+) -> Result<reqwest::ClientBuilder, TlsError> {
+    for pem in &tls.ca {
+        for cert in parse_ca_bundle(pem.as_bytes()) {
+            builder = builder.add_root_certificate(cert);
+        }
+    }
+    let cert = drop_blank(tls.cert.as_deref());
+    let key = drop_blank(tls.key.as_deref());
+    if let (Some(cert), Some(key)) = (cert, key) {
+        // reqwest's `Identity::from_pem` (gated on the `rustls`
+        // feature pacquet builds with) takes a single PEM buffer
+        // containing *both* the certificate and the private key, in
+        // any order. Concatenating with a `\n` separator handles
+        // both pnpm-style configs (where `cert=` and `key=` arrive
+        // separately) and users who paste them into one field.
+        //
+        // rustls accepts PKCS#1 (`-----BEGIN RSA PRIVATE KEY-----`),
+        // PKCS#8 (`-----BEGIN PRIVATE KEY-----`), and EC
+        // (`-----BEGIN EC PRIVATE KEY-----`) private keys — same
+        // surface area Node's `tls.createSecureContext` exposes,
+        // and the surface pnpm hands to undici. PKCS#12 (`.pfx`) is
+        // not supported by pnpm at the config layer (no `pfx=`
+        // option in pnpm's `.npmrc` allow-list), so pacquet doesn't
+        // need to handle it either.
+        let combined = format!("{cert}\n{key}");
+        let identity = Identity::from_pem(combined.as_bytes())
+            .map_err(|source| TlsError::InvalidClientIdentity { reason: source.to_string() })?;
+        builder = builder.identity(identity);
+    }
+    // The `strict-ssl` default is `true`, applied here at client-build
+    // time rather than at config-parse time.
+    if !tls.strict_ssl.unwrap_or(true) {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    if let Some(addr) = tls.local_address {
+        builder = builder.local_address(addr);
+    }
+    Ok(builder)
+}
+
+/// `None` for a PEM slot that is empty or all whitespace.
+///
+/// A blank setting is how an unset one looks: a `cert=` line a config
+/// generator wrote out with nothing after it, or a `key=${CORP_KEY}`
+/// whose variable never resolved. pnpm tests these fields for
+/// truthiness before handing them to undici, so a blank one never
+/// reaches Node's TLS layer; pacquet drops it at the same point rather
+/// than pair it with its counterpart and fail the install on the
+/// identity rustls then rejects (pnpm/pnpm#14646).
+fn drop_blank(pem: Option<&str>) -> Option<&str> {
+    pem.filter(|pem| !pem.trim().is_empty())
+}
+
+/// Error surface of [`ThrottledClient::for_installs`]. Wraps either a
+/// proxy URL failure or a TLS material failure — the caller gets one
+/// error type to handle regardless of which side of `for_installs`
+/// rejected the input.
+#[derive(Debug, derive_more::Display, derive_more::Error, miette::Diagnostic)]
+#[non_exhaustive]
+pub enum ForInstallsError {
+    #[diagnostic(transparent)]
+    Proxy(#[error(source)] ProxyError),
+
+    #[diagnostic(transparent)]
+    Tls(#[error(source)] TlsError),
+
+    /// `network_concurrency` resolved to `0`. A zero-permit semaphore
+    /// would make every `acquire` block forever, hanging the install.
+    /// pnpm rejects the same value — its `p-queue` throws
+    /// `Expected concurrency to be a number from 1 and up` — so pacquet
+    /// fails fast rather than deadlock.
+    #[display("networkConcurrency must be at least 1")]
+    ZeroNetworkConcurrency,
+
+    /// reqwest rejected the assembled client configuration, with both
+    /// the platform trust store and the bundled Mozilla roots. The
+    /// platform attempt is the source (it is the one that describes
+    /// the environment); the retry's own failure is spelled out too,
+    /// since the two can differ.
+    #[display("Failed to build the HTTP client (retry with bundled CA roots: {bundled})")]
+    ClientBuild {
+        #[error(source)]
+        platform: reqwest::Error,
+        bundled: reqwest::Error,
+    },
+}
+
+impl From<ProxyError> for ForInstallsError {
+    fn from(value: ProxyError) -> Self {
+        ForInstallsError::Proxy(value)
+    }
+}
+
+impl From<TlsError> for ForInstallsError {
+    fn from(value: TlsError) -> Self {
+        ForInstallsError::Tls(value)
+    }
+}
+
+/// Build a [`Proxy`] that routes only requests whose target scheme matches
+/// `scheme` ("http" or "https") and whose host doesn't fall under the
+/// no-proxy bypass. Userinfo is stripped from the URL and re-attached
+/// via [`Proxy::basic_auth`] after percent-decoding so usernames /
+/// passwords with `%XX` escapes (e.g. `@` in a password) reach the
+/// upstream proxy decoded.
+fn build_scheme_proxy(
+    url: reqwest::Url,
+    scheme: &'static str,
+    no_proxy: Arc<NoProxyMatcher>,
+) -> Proxy {
+    let (clean_url, auth) = strip_userinfo(url);
+    let mut proxy = Proxy::custom(move |target| {
+        if no_proxy.matches_url(target) {
+            return None;
+        }
+        (target.scheme() == scheme).then(|| clean_url.clone())
+    });
+    if let Some((user, pass)) = auth {
+        proxy = proxy.basic_auth(&user, &pass);
+    }
+    proxy
+}
+
+/// Default number of concurrent in-flight network requests.
+///
+/// The `networkConcurrency` formula:
+///
+/// ```text
+/// networkConcurrency = min(96, max(maxWorkers * 3, 64))
+/// // maxWorkers = max(1, availableParallelism() - 1)
+/// ```
+///
+/// Concretely: 64 up to a 22-core machine, scaling with cores beyond
+/// that, capped at 96. The floor matters more than the scaling:
+/// downloads are I/O-bound, not CPU-bound, and a low-latency registry
+/// only saturates when enough requests are in flight — a CPU-derived
+/// floor left 4-core CI runners draining 600-tarball installs 16 at a
+/// time, several times slower than the same network could serve.
+///
+/// Uses [`std::thread::available_parallelism`] rather than
+/// `num_cpus::get()` so cgroup / CPU-quota limits in containers and
+/// CI runners are respected — `num_cpus` reports the host's logical
+/// CPU count, which on a quota-limited runner can over-report and
+/// push effective concurrency past what the kernel will actually
+/// schedule (matching the convention `crates/cli` already uses for
+/// rayon pool sizing, see `crates/cli/src/lib.rs`).
+pub fn default_network_concurrency() -> usize {
+    let available_parallelism = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+    let max_workers = available_parallelism.saturating_sub(1).max(1);
+    max_workers.saturating_mul(3).clamp(64, 96)
+}
+
+/// This is only necessary for tests.
+impl Default for ThrottledClient {
+    fn default() -> Self {
+        ThrottledClient::new_for_installs()
+    }
+}
