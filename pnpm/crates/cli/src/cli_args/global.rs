@@ -1496,8 +1496,38 @@ fn cleanup_global_install_dir(
     group: &GlobalPackageInfo,
     cleanup: &GlobalInstallCleanup<'_>,
 ) -> Option<ArtifactCleanupError> {
-    if is_subdir(cleanup.global_pkg_dir, &group.install_dir) {
-        match fs::remove_dir_all(&group.install_dir) {
+    // The global scanner canonicalizes install_dir. Canonicalize both sides
+    // here so ordinary and verbatim Windows paths use the same representation.
+    let global_pkg_dir = match fs::canonicalize(cleanup.global_pkg_dir) {
+        Ok(path) => path,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+        Err(source) => {
+            return Some(ArtifactCleanupError {
+                context: format!(
+                    "canonicalize global packages directory at {}",
+                    cleanup.global_pkg_dir.display(),
+                ),
+                source,
+            });
+        }
+    };
+    let install_dir = match fs::canonicalize(&group.install_dir) {
+        Ok(path) => path,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+        Err(source) => {
+            return Some(ArtifactCleanupError {
+                context: format!(
+                    "canonicalize {} install directory at {}",
+                    cleanup.context,
+                    group.install_dir.display(),
+                ),
+                source,
+            });
+        }
+    };
+    // Only remove strict descendants, never the global packages directory itself.
+    if install_dir != global_pkg_dir && is_subdir(&global_pkg_dir, &install_dir) {
+        match fs::remove_dir_all(&install_dir) {
             Ok(()) => return None,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
             Err(source) => {
