@@ -107,6 +107,11 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install crates
+        uses: $/.github/actions/install-crates
+        with:
+          container-build: 'true'
+
       - name: Build
         shell: bash
         run: cargo build --locked -p pnpm-cli --bin pnpm --release --target ${{ matrix.target }}
